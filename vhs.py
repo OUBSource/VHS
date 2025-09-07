@@ -1,11 +1,14 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import numpy as np
 import cv2
 import random
 import threading
 import time
+import os
+from datetime import datetime
+import queue
 
 class VHS:
     def __init__(self, lumaCompressionRate=1.92, lumaNoiseSigma=2, lumaNoiseMean=-10,
@@ -16,8 +19,8 @@ class VHS:
         self.lumaNoiseMean = lumaNoiseMean
         self.chromaCompressionRate = chromaCompressionRate
         self.chromaNoiseIntensity = chromaNoiseIntensity
-        self.verticalBlur = verticalBlur
-        self.horizontalBlur = horizontalBlur
+        self.verticalBlur = max(1, int(verticalBlur))
+        self.horizontalBlur = max(1, int(horizontalBlur))
         self.borderSize = borderSize / 100
         self.generation = 3
 
@@ -42,7 +45,7 @@ class VHS:
     def cut_black_line_border(self, image: np.ndarray, bordersize: int = None) -> None:
         h, w, _ = image.shape
         if bordersize is None:
-            line_width = int(w * self.borderSize)  # 1.7%
+            line_width = int(w * self.borderSize)
         else:
             line_width = bordersize
         image[:, -1 * line_width:] = 0
@@ -64,7 +67,13 @@ class VHS:
         return step2
 
     def blur(self, image):
-        filtered_image = cv2.blur(image, (int(self.horizontalBlur), int(self.verticalBlur)))
+        # Гарантируем целые числа и минимальный размер 1
+        ksize_x = max(1, int(self.horizontalBlur))
+        ksize_y = max(1, int(self.verticalBlur))
+        # Делаем размер ядра нечетным
+        ksize_x = ksize_x if ksize_x % 2 == 1 else ksize_x + 1
+        ksize_y = ksize_y if ksize_y % 2 == 1 else ksize_y + 1
+        filtered_image = cv2.GaussianBlur(image, (ksize_x, ksize_y), 0)
         return filtered_image
 
     def waves(self, img):
@@ -158,12 +167,144 @@ def pil_to_cv2(pil_img):
     open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
     return open_cv_image
 
+class VideoRenderer:
+    def __init__(self, input_path, output_path, vhs_params, progress_callback=None):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.vhs_params = vhs_params
+        self.progress_callback = progress_callback
+        self.stop_rendering = False
+        
+        # Получаем информацию о видео
+        self.cap = cv2.VideoCapture(input_path)
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Настройки кодека для быстрого кодирования
+        if output_path.endswith('.mp4'):
+            self.fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        else:
+            self.fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        
+        self.cap.release()
+
+    def render(self):
+        try:
+            # Создаем VideoWriter с настройками для быстрой записи
+            out = cv2.VideoWriter(self.output_path, self.fourcc, self.fps, (self.width, self.height))
+            
+            if not out.isOpened():
+                return False, "Не удалось создать выходной файл"
+            
+            # Создаем пул потоков для параллельной обработки
+            frame_queue = queue.Queue(maxsize=10)
+            processed_queue = queue.Queue(maxsize=10)
+            
+            # Запускаем потоки для обработки кадров
+            processing_threads = []
+            for _ in range(4):  # 4 потока для обработки
+                thread = threading.Thread(target=self._process_frames_worker, 
+                                        args=(frame_queue, processed_queue))
+                thread.daemon = True
+                thread.start()
+                processing_threads.append(thread)
+            
+            # Поток для записи кадров
+            write_thread = threading.Thread(target=self._write_frames_worker, 
+                                          args=(out, processed_queue))
+            write_thread.daemon = True
+            write_thread.start()
+            
+            # Читаем и отправляем кадры на обработку
+            cap = cv2.VideoCapture(self.input_path)
+            current_frame = 0
+            
+            while not self.stop_rendering and current_frame < self.total_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                frame_queue.put((current_frame, frame))
+                current_frame += 1
+                
+                if self.progress_callback and current_frame % 10 == 0:
+                    progress = (current_frame / self.total_frames) * 100
+                    self.progress_callback(progress, current_frame)
+            
+            # Сигнализируем о завершении
+            for _ in range(len(processing_threads)):
+                frame_queue.put((None, None))
+            
+            # Ждем завершения обработки
+            for thread in processing_threads:
+                thread.join(timeout=1.0)
+            
+            # Сигнализируем о завершении записи
+            processed_queue.put((None, None))
+            write_thread.join(timeout=2.0)
+            
+            cap.release()
+            out.release()
+            
+            return not self.stop_rendering, "Успешно" if not self.stop_rendering else "Прервано"
+            
+        except Exception as e:
+            return False, f"Ошибка: {str(e)}"
+
+    def _process_frames_worker(self, input_queue, output_queue):
+        vhs = VHS(**self.vhs_params)
+        
+        while not self.stop_rendering:
+            try:
+                frame_data = input_queue.get(timeout=1.0)
+                if frame_data[0] is None:
+                    break
+                
+                frame_idx, frame = frame_data
+                processed_frame = vhs.applyVHSEffect(frame)
+                output_queue.put((frame_idx, processed_frame))
+                
+            except queue.Empty:
+                if self.stop_rendering:
+                    break
+                continue
+
+    def _write_frames_worker(self, out, input_queue):
+        expected_frame = 0
+        buffer = {}
+        
+        while not self.stop_rendering:
+            try:
+                frame_data = input_queue.get(timeout=1.0)
+                if frame_data[0] is None:
+                    break
+                
+                frame_idx, frame = frame_data
+                buffer[frame_idx] = frame
+                
+                # Записываем кадры по порядку
+                while expected_frame in buffer:
+                    out.write(buffer[expected_frame])
+                    del buffer[expected_frame]
+                    expected_frame += 1
+                    
+            except queue.Empty:
+                if self.stop_rendering:
+                    break
+                continue
+
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("VHS Эффект - Фото и Видео с живым предпросмотром")
         self.root.geometry("1024x768")
-        self.root.iconbitmap("sys\\icon.ico")
+        
+        # Создаем папку для временных файлов
+        self.temp_dir = "temp_vhs"
+        if not os.path.exists(self.temp_dir):
+            os.makedirs(self.temp_dir)
 
         self.vhs = VHS()
 
@@ -180,17 +321,39 @@ class App:
         btn_frame.pack(pady=5)
 
         self.btn_load_img = tk.Button(btn_frame, text="Загрузить фото", command=self.load_image)
-        self.btn_load_img.grid(row=0, column=0, padx=10)
+        self.btn_load_img.grid(row=0, column=0, padx=5)
 
         self.btn_load_vid = tk.Button(btn_frame, text="Загрузить видео", command=self.load_video)
-        self.btn_load_vid.grid(row=0, column=1, padx=10)
+        self.btn_load_vid.grid(row=0, column=1, padx=5)
 
-        self.btn_save = tk.Button(btn_frame, text="Применить и сохранить", command=self.apply_and_save, state=tk.DISABLED)
-        self.btn_save.grid(row=0, column=2, padx=10)
+        self.btn_save = tk.Button(btn_frame, text="Сохранить фото", command=self.apply_and_save, state=tk.DISABLED)
+        self.btn_save.grid(row=0, column=2, padx=5)
 
         # Пауза для видео
         self.btn_pause = tk.Button(btn_frame, text="Пауза видео", command=self.toggle_pause, state=tk.DISABLED)
-        self.btn_pause.grid(row=0, column=3, padx=10)
+        self.btn_pause.grid(row=0, column=3, padx=5)
+
+        # Рендеринг видео
+        self.btn_render = tk.Button(btn_frame, text="Рендерить видео", command=self.render_video, state=tk.DISABLED)
+        self.btn_render.grid(row=0, column=4, padx=5)
+
+        self.btn_stop_render = tk.Button(btn_frame, text="Стоп рендер", command=self.stop_rendering, state=tk.DISABLED)
+        self.btn_stop_render.grid(row=0, column=5, padx=5)
+
+        # Прогресс бар для рендеринга
+        self.progress_frame = tk.Frame(root)
+        self.progress_frame.pack(pady=5, fill="x", padx=20)
+        
+        self.progress_label = tk.Label(self.progress_frame, text="", font=("Arial", 10))
+        self.progress_label.pack()
+        
+        self.progress = ttk.Progressbar(self.progress_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
+        self.progress.pack(fill="x", pady=2)
+        
+        self.time_label = tk.Label(self.progress_frame, text="", font=("Arial", 9))
+        self.time_label.pack()
+        
+        self.progress_frame.pack_forget()
 
         # Настройки слайдеры
         self.params_frame = tk.LabelFrame(root, text="Настройки VHS", padx=10, pady=10)
@@ -229,16 +392,27 @@ class App:
         self.is_video = False
         self.is_paused = False
         self.stop_video = False
+        self.video_fps = 30
+        self.video_width = 0
+        self.video_height = 0
+        self.total_frames = 0
 
-        # Для плавного изменения параметров видео (слегка случайные глитчи)
+        # Для плавного изменения параметров видео
         self.base_params = {}
+
+        # Для рендеринга
+        self.is_rendering = False
+        self.stop_render_flag = False
+        self.renderer = None
+        self.start_time = 0
 
     def create_slider(self, label, var, frm, to, resolution):
         frame = tk.Frame(self.params_frame)
-        frame.pack(fill="x", pady=5)
+        frame.pack(fill="x", pady=2)
         lbl = tk.Label(frame, text=label, width=20, anchor="w")
         lbl.pack(side="left")
-        slider = tk.Scale(frame, variable=var, from_=frm, to=to, resolution=resolution, orient=tk.HORIZONTAL, length=400)
+        slider = tk.Scale(frame, variable=var, from_=frm, to=to, resolution=resolution, 
+                         orient=tk.HORIZONTAL, length=400, showvalue=1)
         slider.pack(side="right")
 
     def load_image(self):
@@ -252,6 +426,7 @@ class App:
         self.img_label.config(text=f"Фото загружено: {file_path.split('/')[-1]}")
         self.btn_save.config(state=tk.NORMAL)
         self.btn_pause.config(state=tk.DISABLED)
+        self.btn_render.config(state=tk.DISABLED)
         self.update_preview()
 
     def load_video(self):
@@ -259,17 +434,30 @@ class App:
         file_path = filedialog.askopenfilename(filetypes=[("Видео файлы", "*.mp4 *.avi *.mov *.mkv")])
         if not file_path:
             return
+        self.video_path = file_path
         self.cap = cv2.VideoCapture(file_path)
         if not self.cap.isOpened():
             messagebox.showerror("Ошибка", "Не удалось открыть видео")
             return
+        
+        # Получаем информацию о видео
+        self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
         self.is_video = True
         self.is_paused = False
         self.stop_video = False
         self.img_label.config(text=f"Видео загружено: {file_path.split('/')[-1]}")
-        self.btn_save.config(state=tk.DISABLED)  # сохранять видео пока не реализовано
+        self.btn_save.config(state=tk.DISABLED)
+        self.btn_render.config(state=tk.NORMAL)
         self.btn_pause.config(state=tk.NORMAL, text="Пауза видео")
-        self.base_params = {
+        self.base_params = self.get_current_params()
+        threading.Thread(target=self.play_video, daemon=True).start()
+
+    def get_current_params(self):
+        return {
             'lumaCompressionRate': self.lumaCompressionRate_var.get(),
             'lumaNoiseSigma': self.lumaNoiseSigma_var.get(),
             'lumaNoiseMean': self.lumaNoiseMean_var.get(),
@@ -279,7 +467,6 @@ class App:
             'horizontalBlur': self.horizontalBlur_var.get(),
             'borderSize': self.borderSize_var.get()
         }
-        threading.Thread(target=self.play_video, daemon=True).start()
 
     def stop_video_playback(self):
         self.stop_video = True
@@ -295,30 +482,23 @@ class App:
                 continue
             ret, frame = self.cap.read()
             if not ret:
-                # Видео закончилось
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
 
-            # Применяем VHS эффект с небольшими глитч-колебаниями параметров
-            vhs_params = {}
-            for key, base_val in self.base_params.items():
-                # колебания ±5% с плавным шумом
-                jitter = base_val * 0.05 * random.uniform(-1, 1)
-                vhs_params[key] = max(0.01, base_val + jitter)
+            # Применяем VHS эффект с текущими параметрами
+            vhs = VHS(**self.base_params)
+            try:
+                processed = vhs.applyVHSEffect(frame)
+                self.processed_image_cv2 = processed
+                self.root.after(0, self.update_image_panel, processed)
+            except Exception as e:
+                print(f"Ошибка обработки кадра: {e}")
+                continue
 
-            vhs = VHS(**vhs_params)
-            processed = vhs.applyVHSEffect(frame)
-
-            # Показать в UI (в main thread через after)
-            self.processed_image_cv2 = processed
-            self.root.after(0, self.update_image_panel, processed)
-
-            # Фреймрейт ~30 FPS
             time.sleep(1/30)
 
     def update_image_panel(self, cv_img):
         pil_img = cv2_to_pil(cv_img)
-        # масштабируем под окно (макс 800x450)
         pil_img.thumbnail((800, 450))
         tk_img = ImageTk.PhotoImage(pil_img)
         self.image_panel.configure(image=tk_img)
@@ -328,50 +508,95 @@ class App:
         if self.loaded_image_cv2 is None:
             messagebox.showwarning("Ошибка", "Сначала загрузите фото")
             return
-        # применить VHS с текущими настройками и сохранить
-        vhs = VHS(
-            lumaCompressionRate=self.lumaCompressionRate_var.get(),
-            lumaNoiseSigma=self.lumaNoiseSigma_var.get(),
-            lumaNoiseMean=self.lumaNoiseMean_var.get(),
-            chromaCompressionRate=self.chromaCompressionRate_var.get(),
-            chromaNoiseIntensity=self.chromaNoiseIntensity_var.get(),
-            verticalBlur=self.verticalBlur_var.get(),
-            horizontalBlur=self.horizontalBlur_var.get(),
-            borderSize=self.borderSize_var.get(),
-        )
+        
+        vhs = VHS(**self.get_current_params())
         result = vhs.applyVHSEffect(self.loaded_image_cv2)
-        cv2.imwrite("output.png", result)
-        messagebox.showinfo("Готово", "Фото сохранено как output.png")
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png"), ("JPEG files", "*.jpg"), ("All files", "*.*")]
+        )
+        if file_path:
+            cv2.imwrite(file_path, result)
+            messagebox.showinfo("Готово", f"Фото сохранено как {file_path}")
+
+    def render_video(self):
+        if not self.is_video or self.video_path is None:
+            messagebox.showwarning("Ошибка", "Сначала загрузите видео")
+            return
+        
+        output_path = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            filetypes=[("MP4 files", "*.mp4"), ("AVI files", "*.avi"), ("All files", "*.*")]
+        )
+        if not output_path:
+            return
+        
+        # Показываем прогресс бар
+        self.progress_frame.pack(pady=5, fill="x", padx=20)
+        self.progress['value'] = 0
+        self.progress_label.config(text="Подготовка к рендерингу...")
+        self.time_label.config(text="")
+        
+        self.is_rendering = True
+        self.stop_render_flag = False
+        self.btn_render.config(state=tk.DISABLED)
+        self.btn_stop_render.config(state=tk.NORMAL)
+        self.start_time = time.time()
+        
+        # Запускаем рендеринг в отдельном потоке
+        threading.Thread(target=self._render_thread, args=(output_path,), daemon=True).start()
+
+    def _render_thread(self, output_path):
+        vhs_params = self.get_current_params()
+        self.renderer = VideoRenderer(self.video_path, output_path, vhs_params, self._update_render_progress)
+        
+        success, message = self.renderer.render()
+        
+        self.root.after(0, self._finish_rendering, success, message, output_path)
+
+    def _update_render_progress(self, progress, current_frame):
+        if self.stop_render_flag:
+            self.renderer.stop_rendering = True
+            return
+        
+        elapsed = time.time() - self.start_time
+        if progress > 0:
+            remaining = (elapsed / progress) * (100 - progress)
+            time_text = f"Прошло: {elapsed:.1f}с | Осталось: {remaining:.1f}с"
+        else:
+            time_text = f"Прошло: {elapsed:.1f}с"
+        
+        self.root.after(0, lambda: self.progress_label.config(
+            text=f"Рендеринг: {progress:.1f}% ({current_frame}/{self.total_frames} кадров)"))
+        self.root.after(0, lambda: self.progress.config(value=progress))
+        self.root.after(0, lambda: self.time_label.config(text=time_text))
+
+    def _finish_rendering(self, success, message, output_path):
+        self.is_rendering = False
+        self.progress_frame.pack_forget()
+        self.btn_render.config(state=tk.NORMAL)
+        self.btn_stop_render.config(state=tk.DISABLED)
+        
+        if success:
+            messagebox.showinfo("Готово", f"Видео сохранено как {output_path}\n{message}")
+        else:
+            messagebox.showinfo("Завершено", message)
+
+    def stop_rendering(self):
+        if self.is_rendering:
+            self.stop_render_flag = True
+            if self.renderer:
+                self.renderer.stop_rendering = True
 
     def on_slider_change(self, *args):
         if self.is_video:
-            # Настройки изменились — обновим базовые параметры для видео
-            self.base_params = {
-                'lumaCompressionRate': self.lumaCompressionRate_var.get(),
-                'lumaNoiseSigma': self.lumaNoiseSigma_var.get(),
-                'lumaNoiseMean': self.lumaNoiseMean_var.get(),
-                'chromaCompressionRate': self.chromaCompressionRate_var.get(),
-                'chromaNoiseIntensity': self.chromaNoiseIntensity_var.get(),
-                'verticalBlur': self.verticalBlur_var.get(),
-                'horizontalBlur': self.horizontalBlur_var.get(),
-                'borderSize': self.borderSize_var.get()
-            }
-            return
-        if self.loaded_image_cv2 is not None:
+            self.base_params = self.get_current_params()
+        elif self.loaded_image_cv2 is not None:
             self.update_preview()
 
     def update_preview(self):
-        # Применяем VHS к текущему фото с текущими настройками без сохранения
-        vhs = VHS(
-            lumaCompressionRate=self.lumaCompressionRate_var.get(),
-            lumaNoiseSigma=self.lumaNoiseSigma_var.get(),
-            lumaNoiseMean=self.lumaNoiseMean_var.get(),
-            chromaCompressionRate=self.chromaCompressionRate_var.get(),
-            chromaNoiseIntensity=self.chromaNoiseIntensity_var.get(),
-            verticalBlur=self.verticalBlur_var.get(),
-            horizontalBlur=self.horizontalBlur_var.get(),
-            borderSize=self.borderSize_var.get(),
-        )
+        vhs = VHS(**self.get_current_params())
         try:
             processed = vhs.applyVHSEffect(self.loaded_image_cv2)
             self.processed_image_cv2 = processed
@@ -385,7 +610,17 @@ class App:
         self.is_paused = not self.is_paused
         self.btn_pause.config(text="Продолжить видео" if self.is_paused else "Пауза видео")
 
+    def on_closing(self):
+        self.stop_video_playback()
+        self.stop_rendering()
+        if os.path.exists(self.temp_dir):
+            for file in os.listdir(self.temp_dir):
+                os.remove(os.path.join(self.temp_dir, file))
+            os.rmdir(self.temp_dir)
+        self.root.destroy()
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
